@@ -78,20 +78,6 @@ input[type=text] {
 }
 input:focus { border-color: var(--gold); }
 
-.threshold-row { margin-bottom: 14px; }
-
-.ink-options { display: flex; gap: 10px; margin-top: 6px; }
-.ink-opt {
-  flex: 1; padding: 9px;
-  background: #f5ede0; border: 1px solid #c4a882;
-  border-radius: 2px; cursor: pointer;
-  font-family: 'DM Mono', monospace; font-size: 12px;
-  letter-spacing: 0.14em; text-transform: uppercase;
-  color: #1c1410; transition: all 0.2s;
-}
-.ink-opt:hover { background: var(--gold); border-color: var(--gold); color: #1c1410; }
-.ink-opt.active { background: var(--gold); color: #1c1410; border-color: var(--gold); }
-
 .filename-row { margin-bottom: 0; }
 
 /* ── Preview ── */
@@ -181,15 +167,6 @@ footer { margin-top: 20px; padding: 16px 0; border-top: 1px solid var(--rule); t
              style="display:none" onchange="handleFile(this.files[0])">
     </div>
 
-    <div class="threshold-row">
-      <label class="lbl">Ink Style</label>
-      <div class="ink-options">
-        <button class="ink-opt" data-value="10" onclick="selectInk(this)">Light</button>
-        <button class="ink-opt active" data-value="18" onclick="selectInk(this)">Normal</button>
-        <button class="ink-opt" data-value="35" onclick="selectInk(this)">Bold</button>
-      </div>
-    </div>
-
     <div class="filename-row">
       <label class="lbl">Filename</label>
       <input type="text" id="filename" placeholder="vectorized">
@@ -241,7 +218,8 @@ async function handleFile(file) {
 
 // ── Vectorization pipeline ────────────────────────────────────────────
 
-function extractInkMask(pixels, w, h, threshold) {
+function extractInkMask(pixels, w, h) {
+  // Step 1: Convert to grayscale
   const gray = new Float32Array(w * h);
   for (let i = 0; i < w * h; i++) {
     gray[i] = pixels[i*4]*0.299 + pixels[i*4+1]*0.587 + pixels[i*4+2]*0.114;
@@ -264,13 +242,72 @@ function extractInkMask(pixels, w, h, threshold) {
     return dst;
   }
 
-  const largeBg = gaussBlur(gray, 18);
-  const smallBg = gaussBlur(gray, 3);
-  const ink = new Uint8Array(w * h);
-  for (let i=0;i<w*h;i++) {
-    if ((largeBg[i]-gray[i])>threshold && (smallBg[i]-gray[i])>threshold*0.65) ink[i]=1;
+  // Step 2: Pre-processing — sharpen by adding high-frequency detail back
+  const blurredGray = gaussBlur(gray, 1);
+  const sharpened = new Float32Array(w * h);
+  const sharpenStrength = 1.8;
+  for (let i = 0; i < w * h; i++) {
+    sharpened[i] = Math.max(0, Math.min(255, gray[i] + sharpenStrength * (gray[i] - blurredGray[i])));
   }
 
+  // Step 3: Normalise contrast — stretch to full 0–255 range
+  let minV = 255, maxV = 0;
+  for (let i = 0; i < w * h; i++) { minV = Math.min(minV, sharpened[i]); maxV = Math.max(maxV, sharpened[i]); }
+  const range = maxV - minV || 1;
+  const normalised = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) normalised[i] = (sharpened[i] - minV) / range * 255;
+
+  // Step 4: Local contrast ink detection with optimised light threshold
+  const THRESHOLD = 8;
+  const largeBg = gaussBlur(normalised, 18);
+  const smallBg = gaussBlur(normalised, 3);
+  const ink = new Uint8Array(w * h);
+  for (let i=0;i<w*h;i++) {
+    if ((largeBg[i]-normalised[i]) > THRESHOLD && (smallBg[i]-normalised[i]) > THRESHOLD * 0.6) ink[i]=1;
+  }
+
+  // Step 4b: Targeted Sobel — only applied in sparse ink regions
+  // Detects leaf edges that local contrast misses, without flooding
+  // dense areas like flower centres with extra noise
+
+  // First, compute local ink density per pixel (how much ink is nearby)
+  const inkDensity = new Float32Array(w * h);
+  const DENSITY_RADIUS = 12;
+  // Approximate with a box blur of the ink mask
+  const inkFloat = new Float32Array(w * h);
+  for (let i=0;i<w*h;i++) inkFloat[i] = ink[i] * 255;
+  const inkBlurred = gaussBlur(inkFloat, DENSITY_RADIUS);
+  // Normalise density to 0–1
+  for (let i=0;i<w*h;i++) inkDensity[i] = inkBlurred[i] / 255;
+
+  // Run Sobel on smoothed image
+  const smoothed = gaussBlur(normalised, 2);
+  const edgeMag = new Float32Array(w * h);
+  let edgeMax = 0;
+  for (let y=1;y<h-1;y++) for (let x=1;x<w-1;x++) {
+    const i = y*w+x;
+    const gx = (
+      -smoothed[(y-1)*w+(x-1)] - 2*smoothed[y*w+(x-1)] - smoothed[(y+1)*w+(x-1)] +
+       smoothed[(y-1)*w+(x+1)] + 2*smoothed[y*w+(x+1)] + smoothed[(y+1)*w+(x+1)]
+    );
+    const gy = (
+      -smoothed[(y-1)*w+(x-1)] - 2*smoothed[(y-1)*w+x] - smoothed[(y-1)*w+(x+1)] +
+       smoothed[(y+1)*w+(x-1)] + 2*smoothed[(y+1)*w+x] + smoothed[(y+1)*w+(x+1)]
+    );
+    edgeMag[i] = Math.sqrt(gx*gx + gy*gy);
+    if (edgeMag[i] > edgeMax) edgeMax = edgeMag[i];
+  }
+
+  // Only add Sobel edges where local ink density is LOW (sparse regions = leaf edges)
+  // and edge magnitude is strong enough
+  const EDGE_THRESHOLD = edgeMax * 0.20;
+  const DENSITY_CUTOFF = 0.08; // only apply in areas with < 8% ink density nearby
+  const combined = new Uint8Array(w * h);
+  for (let i=0;i<w*h;i++) {
+    combined[i] = ink[i] || (edgeMag[i] > EDGE_THRESHOLD && inkDensity[i] < DENSITY_CUTOFF) ? 1 : 0;
+  }
+
+  // Step 5: Binary closing
   function dilate(src) {
     const dst=new Uint8Array(src.length);
     for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
@@ -296,7 +333,67 @@ function extractInkMask(pixels, w, h, threshold) {
     return dst;
   }
 
-  return erode(dilate(dilate(ink)));
+  const closed = erode(dilate(dilate(combined)));
+
+  // Step 5b: Larger closing pass in sparse ink regions to bridge leaf edge gaps
+  // Dilate more aggressively where ink density is low, then erode back
+  function dilateR(src, r) {
+    const dst = new Uint8Array(src.length);
+    for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
+      if (src[y*w+x]) { dst[y*w+x]=1; continue; }
+      outer: for (let dy=-r;dy<=r;dy++) for (let dx=-r;dx<=r;dx++) {
+        if (dy*dy+dx*dx > r*r) continue;
+        const ny=y+dy, nx=x+dx;
+        if (ny>=0&&ny<h&&nx>=0&&nx<w&&src[ny*w+nx]) { dst[y*w+x]=1; break outer; }
+      }
+    }
+    return dst;
+  }
+  function erodeR(src, r) {
+    const dst = new Uint8Array(src.length);
+    for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
+      if (!src[y*w+x]) continue;
+      let ok = true;
+      outer: for (let dy=-r;dy<=r&&ok;dy++) for (let dx=-r;dx<=r&&ok;dx++) {
+        if (dy*dy+dx*dx > r*r) continue;
+        const ny=y+dy, nx=x+dx;
+        if (ny<0||ny>=h||nx<0||nx>=w||!src[ny*w+nx]) ok=false;
+      }
+      if (ok) dst[y*w+x]=1;
+    }
+    return dst;
+  }
+
+  // Apply larger closing (radius 3) only in sparse regions
+  const bigClosed = erodeR(dilateR(closed, 3), 3);
+  const healed = new Uint8Array(w * h);
+  for (let i=0;i<w*h;i++) {
+    // In sparse areas use bigger closing, in dense areas keep original
+    healed[i] = inkDensity[i] < DENSITY_CUTOFF ? bigClosed[i] : closed[i];
+  }
+
+  // Step 6: Remove small noise components (< 12px) via flood fill
+  const cleaned = new Uint8Array(w * h);
+  const compLabels = new Int32Array(w * h).fill(-1);
+  let nextLabel = 0;
+  const compSizes = [];
+  for (let i = 0; i < w * h; i++) {
+    if (!healed[i] || compLabels[i] >= 0) continue;
+    const queue = [i]; compLabels[i] = nextLabel; let sz = 0;
+    while (queue.length) {
+      const idx = queue.pop(); sz++;
+      const cy = Math.floor(idx/w), cx = idx%w;
+      for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++) {
+        const ny=cy+dy,nx=cx+dx,ni=ny*w+nx;
+        if (ny>=0&&ny<h&&nx>=0&&nx<w&&healed[ni]&&compLabels[ni]<0) { compLabels[ni]=nextLabel; queue.push(ni); }
+      }
+    }
+    compSizes.push(sz); nextLabel++;
+  }
+  for (let i = 0; i < w * h; i++) {
+    if (compLabels[i] >= 0 && compSizes[compLabels[i]] >= 40) cleaned[i] = 1;
+  }
+  return cleaned;
 }
 
 function skeletonize(ink, w, h) {
@@ -371,17 +468,35 @@ function traceStrokes(skel, w, h) {
     return path;
   }
 
-  for (const ep of endpoints) if (!visited.has(ep)) { const s=traceFrom(ep); if (s.length>=4) strokes.push(s); }
-  for (const idx of pts) if (!visited.has(idx)) { const s=traceFrom(idx); if (s.length>=4) strokes.push(s); }
+  for (const ep of endpoints) if (!visited.has(ep)) { const s=traceFrom(ep); if (s.length>=16) strokes.push(s); }
+  for (const idx of pts) if (!visited.has(idx)) { const s=traceFrom(idx); if (s.length>=16) strokes.push(s); }
 
   return strokes.map(s=>s.map(idx=>[idx%w,Math.floor(idx/w)]));
 }
 
+function douglasPeucker(pts, epsilon) {
+  if (pts.length < 3) return pts;
+  let maxDist = 0, maxIdx = 0;
+  const [x1,y1] = pts[0], [x2,y2] = pts[pts.length-1];
+  const dx = x2-x1, dy = y2-y1, len = Math.sqrt(dx*dx+dy*dy) || 1;
+  for (let i=1;i<pts.length-1;i++) {
+    const dist = Math.abs((pts[i][1]-y1)*dx - (pts[i][0]-x1)*dy) / len;
+    if (dist > maxDist) { maxDist = dist; maxIdx = i; }
+  }
+  if (maxDist > epsilon) {
+    const left  = douglasPeucker(pts.slice(0, maxIdx+1), epsilon);
+    const right = douglasPeucker(pts.slice(maxIdx), epsilon);
+    return [...left.slice(0,-1), ...right];
+  }
+  return [pts[0], pts[pts.length-1]];
+}
+
 function renderStrokes(strokes, inkMask, maskW, maskH, canvas) {
   const scale=canvas.width/maskW;
-  const inkPx=inkMask.reduce((a,b)=>a+b,0);
-  const skelPx=strokes.reduce((a,s)=>a+s.length,0);
-  const strokeW=Math.max(3,Math.min(24,(inkPx/Math.max(skelPx,1))*scale*0.85));
+
+  // Consistent normalised stroke width — not driven by ink pixel count
+  // which over-weights dense areas like flower centres
+  const strokeW = Math.max(2, Math.min(5, 3.0 * scale));
 
   const ctx=canvas.getContext('2d');
   ctx.clearRect(0,0,canvas.width,canvas.height);
@@ -392,16 +507,19 @@ function renderStrokes(strokes, inkMask, maskW, maskH, canvas) {
 
   for (const stroke of strokes) {
     if (stroke.length<2) continue;
-    const step=Math.max(1,Math.floor(stroke.length/60));
-    const sp=[];
-    for (let i=0;i<stroke.length;i+=step) sp.push(stroke[i]);
-    if (sp[sp.length-1]!==stroke[stroke.length-1]) sp.push(stroke[stroke.length-1]);
+
+    // Douglas-Peucker simplification — removes redundant points
+    // while preserving the shape. Epsilon of 1.5px gives clean curves
+    // without losing meaningful detail.
+    const sp = douglasPeucker(stroke, 1.5);
+    if (sp.length < 2) continue;
 
     ctx.beginPath();
     ctx.moveTo(sp[0][0]*scale,sp[0][1]*scale);
     for (let i=1;i<sp.length;i++) {
       const p0=sp[Math.max(0,i-2)],p1=sp[i-1],p2=sp[i],p3=sp[Math.min(sp.length-1,i+1)];
-      const t=0.4;
+      // Higher tension = smoother, more flowing curves
+      const t=0.6;
       ctx.bezierCurveTo(
         p1[0]*scale+t*(p2[0]-p0[0])*scale/3, p1[1]*scale+t*(p2[1]-p0[1])*scale/3,
         p2[0]*scale-t*(p3[0]-p1[0])*scale/3, p2[1]*scale-t*(p3[1]-p1[1])*scale/3,
@@ -417,8 +535,6 @@ async function vectorizeAndRender(dataUrl) {
     const img = new Image();
     img.onload = () => {
       const iw=img.naturalWidth, ih=img.naturalHeight;
-      const threshold=getThreshold();
-
       const off=document.createElement('canvas');
       off.width=iw; off.height=ih;
       off.getContext('2d').drawImage(img,0,0);
@@ -427,11 +543,22 @@ async function vectorizeAndRender(dataUrl) {
       setStatus('<span class="spinner"></span>Extracting ink…');
       setTimeout(()=>{
         try {
-          const inkMask=extractInkMask(pixels,iw,ih,threshold);
+          const inkMask=extractInkMask(pixels,iw,ih);
           setStatus('<span class="spinner"></span>Vectorizing…');
           setTimeout(()=>{
             try {
-              const skel=skeletonize(inkMask,iw,ih);
+              // Extra dilation pass to bridge small gaps before skeletonizing
+              const bridged = new Uint8Array(inkMask.length);
+              for (let y=0;y<ih;y++) for (let x=0;x<iw;x++) {
+                if (inkMask[y*iw+x]) { bridged[y*iw+x]=1; continue; }
+                let nbCount=0;
+                for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++) {
+                  const ny=y+dy,nx=x+dx;
+                  if (ny>=0&&ny<ih&&nx>=0&&nx<iw&&inkMask[ny*iw+nx]) nbCount++;
+                }
+                if (nbCount>=2) bridged[y*iw+x]=1;
+              }
+              const skel=skeletonize(bridged,iw,ih);
               const strokes=traceStrokes(skel,iw,ih);
               const outW=1000, outH=Math.round(ih*(outW/iw));
               const canvas=document.getElementById('preview-canvas');
@@ -500,16 +627,6 @@ function resetPreview() {
 function setStatus(msg,cls) {
   const el=document.getElementById('status');
   el.innerHTML=msg; el.className=cls||'';
-}
-
-function selectInk(btn) {
-  document.querySelectorAll('.ink-opt').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-}
-
-function getThreshold() {
-  const active = document.querySelector('.ink-opt.active');
-  return active ? parseInt(active.dataset.value) : 18;
 }
 
 function fileToBase64(file) {
